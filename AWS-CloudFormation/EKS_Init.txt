@@ -1,0 +1,398 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS EKS Private Cluster using existing Shared VPC'
+
+Parameters:
+  ClusterName:
+    Type: String
+    Default: 'my-eks-private-cluster'
+    Description: Name of the EKS cluster
+  
+  KubernetesVersion:
+    Type: String
+    Default: '1.28'
+    Description: Kubernetes version for the EKS cluster
+  
+  # VPC Parameters
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: ID of the existing Shared VPC
+  
+  PrivateSubnetId1:
+    Type: AWS::EC2::Subnet::Id
+    Description: ID of the first private subnet for EKS nodes
+  
+  PrivateSubnetId2:
+    Type: AWS::EC2::Subnet::Id
+    Description: ID of the second private subnet for EKS nodes
+  
+  PublicSubnetId1:
+    Type: AWS::EC2::Subnet::Id
+    Description: ID of the first public subnet (for VPC endpoints if needed)
+    Default: ''
+  
+  PublicSubnetId2:
+    Type: AWS::EC2::Subnet::Id
+    Description: ID of the second public subnet (for VPC endpoints if needed)
+    Default: ''
+  
+  # Node Group Parameters
+  NodeGroupInstanceType:
+    Type: String
+    Default: 't3.medium'
+    Description: EC2 instance type for worker nodes
+    AllowedValues:
+      - t3.small
+      - t3.medium
+      - t3.large
+      - t3.xlarge
+      - m5.large
+      - m5.xlarge
+      - m5.2xlarge
+      - c5.large
+      - c5.xlarge
+      - c5.2xlarge
+  
+  NodeGroupDesiredSize:
+    Type: Number
+    Default: 2
+    Description: Desired number of worker nodes
+    MinValue: 1
+    MaxValue: 20
+  
+  NodeGroupMinSize:
+    Type: Number
+    Default: 1
+    Description: Minimum number of worker nodes
+    MinValue: 1
+  
+  NodeGroupMaxSize:
+    Type: Number
+    Default: 4
+    Description: Maximum number of worker nodes
+    MinValue: 1
+    MaxValue: 20
+  
+  NodeGroupDiskSize:
+    Type: Number
+    Default: 20
+    Description: Node group disk size in GB
+    MinValue: 20
+    MaxValue: 100
+  
+  CreateVPCEndpoints:
+    Type: String
+    Default: 'Yes'
+    AllowedValues:
+      - 'Yes'
+      - 'No'
+    Description: Create VPC endpoints for ECR and S3 (recommended for private clusters)
+
+Conditions:
+  CreateEndpoints: !Equals [!Ref CreateVPCEndpoints, 'Yes']
+  HasPublicSubnets: !And
+    - !Not [!Equals [!Ref PublicSubnetId1, '']]
+    - !Not [!Equals [!Ref PublicSubnetId2, '']]
+
+Resources:
+  # Security Groups
+  ControlPlaneSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for EKS control plane
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref NodeSecurityGroup
+          Description: Allow HTTPS from worker nodes
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-control-plane-sg'
+
+  NodeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for EKS worker nodes
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 1025
+          ToPort: 65535
+          SourceSecurityGroupId: !Ref ControlPlaneSecurityGroup
+          Description: Allow worker Kubelets and pods to receive communication from the cluster control plane
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref ControlPlaneSecurityGroup
+          Description: Allow pods running extension API servers on port 443 to receive communication from cluster control plane
+        - IpProtocol: '-1'
+          SourceSecurityGroupId: !Ref NodeSecurityGroup
+          Description: Allow nodes to communicate with each other
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-node-sg'
+
+  # Update Control Plane Security Group to allow communication back to nodes
+  ControlPlaneEgressToNodeSecurityGroup:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      Description: Allow the cluster control plane to communicate with worker nodes
+      GroupId: !Ref ControlPlaneSecurityGroup
+      SourceSecurityGroupId: !Ref NodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 1025
+      ToPort: 65535
+
+  ControlPlaneEgressToNodeSecurityGroupOn443:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      Description: Allow the cluster control plane to communicate with pods running extension API servers on port 443
+      GroupId: !Ref ControlPlaneSecurityGroup
+      SourceSecurityGroupId: !Ref NodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+
+  # EKS Cluster Service Role
+  EKSClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-cluster-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - eks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-cluster-role'
+
+  # EKS Cluster
+  EKSCluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Ref ClusterName
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt EKSClusterRole.Arn
+      ResourcesVpcConfig:
+        SecurityGroupIds:
+          - !Ref ControlPlaneSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnetId1
+          - !Ref PrivateSubnetId2
+        EndpointConfigPrivate: true
+        EndpointConfigPublic: false
+        PublicAccessCidrs:
+          - 0.0.0.0/0
+      Logging:
+        EnabledTypes:
+          - Type: api
+          - Type: audit
+          - Type: authenticator
+          - Type: controllerManager
+          - Type: scheduler
+      Tags:
+        - Key: Name
+          Value: !Ref ClusterName
+        - Key: Environment
+          Value: production
+
+  # EKS Node Group Role
+  EKSNodeGroupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-nodegroup-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-nodegroup-role'
+
+  # EKS Node Group
+  EKSNodeGroup:
+    Type: AWS::EKS::Nodegroup
+    DependsOn: EKSCluster
+    Properties:
+      ClusterName: !Ref ClusterName
+      NodegroupName: !Sub '${ClusterName}-nodegroup'
+      NodeRole: !GetAtt EKSNodeGroupRole.Arn
+      InstanceTypes:
+        - !Ref NodeGroupInstanceType
+      AmiType: AL2_x86_64
+      CapacityType: ON_DEMAND
+      DiskSize: !Ref NodeGroupDiskSize
+      Subnets:
+        - !Ref PrivateSubnetId1
+        - !Ref PrivateSubnetId2
+      RemoteAccess:
+        Ec2SshKey: !Ref 'AWS::NoValue'
+      ScalingConfig:
+        MinSize: !Ref NodeGroupMinSize
+        MaxSize: !Ref NodeGroupMaxSize
+        DesiredSize: !Ref NodeGroupDesiredSize
+      UpdateConfig:
+        MaxUnavailable: 1
+      Labels:
+        Environment: production
+        NodeGroup: !Sub '${ClusterName}-nodegroup'
+      Tags:
+        Environment: production
+        NodeGroup: !Sub '${ClusterName}-nodegroup'
+        Name: !Sub '${ClusterName}-nodegroup'
+
+  # VPC Endpoints for private cluster connectivity
+  VPCEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: CreateEndpoints
+    Properties:
+      GroupDescription: Security group for VPC endpoints
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref NodeSecurityGroup
+          Description: HTTPS from EKS nodes
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.0.0.0/8
+          Description: HTTPS from VPC CIDR
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-vpc-endpoint-sg'
+
+  EC2VPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateEndpoints
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2'
+      VpcEndpointType: Interface
+      SubnetIds: !If
+        - HasPublicSubnets
+        - [!Ref PublicSubnetId1, !Ref PublicSubnetId2]
+        - [!Ref PrivateSubnetId1, !Ref PrivateSubnetId2]
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action:
+              - ec2:DescribeInstances
+              - ec2:DescribeInstanceAttribute
+              - ec2:DescribeRegions
+              - ec2:DescribeSecurityGroups
+              - ec2:DescribeSubnets
+              - ec2:DescribeVolumes
+              - ec2:DescribeVpcs
+              - ec2:DescribeAvailabilityZones
+            Resource: '*'
+
+  ECRAPIVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateEndpoints
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ecr.api'
+      VpcEndpointType: Interface
+      SubnetIds: !If
+        - HasPublicSubnets
+        - [!Ref PublicSubnetId1, !Ref PublicSubnetId2]
+        - [!Ref PrivateSubnetId1, !Ref PrivateSubnetId2]
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+  ECRDKRVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateEndpoints
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ecr.dkr'
+      VpcEndpointType: Interface
+      SubnetIds: !If
+        - HasPublicSubnets
+        - [!Ref PublicSubnetId1, !Ref PublicSubnetId2]
+        - [!Ref PrivateSubnetId1, !Ref PrivateSubnetId2]
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+  S3VPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateEndpoints
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+
+Outputs:
+  ClusterName:
+    Description: EKS Cluster Name
+    Value: !Ref EKSCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterName'
+
+  ClusterArn:
+    Description: EKS Cluster ARN
+    Value: !GetAtt EKSCluster.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterArn'
+
+  ClusterEndpoint:
+    Description: EKS Cluster Endpoint
+    Value: !GetAtt EKSCluster.Endpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterEndpoint'
+
+  ClusterSecurityGroupId:
+    Description: Security group ID attached to the EKS cluster
+    Value: !GetAtt EKSCluster.ClusterSecurityGroupId
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterSecurityGroupId'
+
+  NodeSecurityGroupId:
+    Description: Security group ID attached to the EKS worker nodes
+    Value: !Ref NodeSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-NodeSecurityGroupId'
+
+  NodeGroupRole:
+    Description: Node Group IAM Role ARN
+    Value: !GetAtt EKSNodeGroupRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-NodeGroupRole'
+
+  ClusterOIDCIssuerURL:
+    Description: The URL on the EKS cluster OIDC Issuer
+    Value: !GetAtt EKSCluster.OpenIdConnectIssuerUrl
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterOIDCIssuerURL'
+
+  KubectlConfigCommand:
+    Description: Command to configure kubectl
+    Value: !Sub 'aws eks update-kubeconfig --region ${AWS::Region} --name ${ClusterName}'
